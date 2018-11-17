@@ -135,6 +135,42 @@ void insert_prefix(mmdb_tree_t *tree, prefix_t *p, int data)
   }
 }
 
+void mmdb_write_primitive_type(FILE *fp, mmdb_type_t type, size_t size, void *val)
+{
+  unsigned char control = (type <= MMDB_MAP) ? (type << 5) : 0;
+  unsigned char ext_type = (type > MMDB_MAP) ? (type - 7) : 0;
+  uint32_t size_bytes = 0, nsize = 0;
+
+  printf("CONTROL %u, type: %d\n", control, type);
+  if (size < 29) {
+      control |= size;
+  } else if (size >= 29 && size < 285) {
+      control |= 29;
+      nsize = 1;
+      size_bytes = size - 29;
+  } else if (size >= 285 && size < 65821) {
+      control |= 30;
+      nsize = 2;
+      size_bytes = size - 285;
+  } else {
+      control |= 31;
+      nsize = 3;
+      size_bytes = size - 65821;
+  }
+
+  printf("Size: %d, nsize: %d, size_bytes: %d\n", size, nsize, size_bytes);
+  printf("Ext type: %d\n", ext_type);
+  printf("Control: %u\n", control);
+  fwrite(&control, 1, 1, fp);
+  if (ext_type > 0) {
+      fwrite(&ext_type, 1, 1, fp);
+  }
+  if (nsize > 0) {
+      size_bytes = htobe32(size_bytes) >> (4-nsize)*8;
+      printf("%d\n", size_bytes);
+      fwrite(&size_bytes, nsize, 1, fp);
+  }
+}
 int mmdb_write_node(mmdb_tree_node_t *node, void* data)
 {
 
@@ -168,23 +204,23 @@ int main(int argc, char **argv)
   mmdb_tree_t *tree = make_tree();
 
   char buf[INET_ADDRSTRLEN+3] = "1.255.0.0";
-  parse_prefix(buf, &prefix);
-  insert_prefix(tree, &prefix, 123456);
+  /* parse_prefix(buf, &prefix); */
+  /* insert_prefix(tree, &prefix, 123456); */
 
-/*
- *   strcpy(buf, "1.2.3.4/24");
- *   parse_prefix(buf, &prefix);
- *   insert_prefix(tree, &prefix, 321);
- * 
- *   strcpy(buf, "1.2.3.4");
- *   parse_prefix(buf, &prefix);
- *   insert_prefix(tree, &prefix, 111);
- */
+  /* strcpy(buf, "1.2.3.4/24"); */
+  /* parse_prefix(buf, &prefix); */
+  /* insert_prefix(tree, &prefix, 321); */
+
+  /* strcpy(buf, "1.2.3.4"); */
+  /* parse_prefix(buf, &prefix); */
+  /* insert_prefix(tree, &prefix, 111); */
 
   traverse_pre_order(tree->root, &print_node, NULL);
 
   FILE *fp = fopen("./test.mmdb", "w");
   mmdb_write_tree(tree, fp);
-  fclose(fp);
   printf("Node count: %d\n", tree->node_count);
+
+  mmdb_write_primitive_type(fp, MMDB_STRING, 3421264, NULL);
+  fclose(fp);
 }

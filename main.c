@@ -6,6 +6,8 @@
 #include <arpa/inet.h>
 #include <endian.h>
 
+#define BUFSIZE 1024
+
 typedef enum {
     /* Normal types 1-7 (that fit into first 3 bits of control byte) */
     MMDB_POINTER=1, MMDB_STRING, MMDB_DOUBLE, MMDB_BYTES, MMDB_UINT16, MMDB_UINT32, MMDB_MAP,
@@ -39,6 +41,10 @@ typedef struct {
     uint16_t binary_format_minor_version;
     uint64_t build_epoch;
     char *description_en;
+
+    char **headers;
+    size_t num_headers;
+    FILE *input;
 } mmdb_tree_t;
 
 typedef struct {
@@ -76,13 +82,14 @@ mmdb_tree_t* make_tree()
     mmdb_tree_t * t = malloc(sizeof(mmdb_tree_t));
     t->root = NULL; //make_tree_node();
     t->node_count = 0;
-    t->record_size = htobe16(32);
-    t->ip_version = htobe16(4);
+    t->record_size = 32;
+    t->ip_version = 4;
     t->database_type = "ipinfo";
     t->description_en = "ipinfo data";
-    t->binary_format_major_version = htobe16(2);
-    t->binary_format_minor_version = htobe16(75);
-    t->build_epoch = htobe64( (uint64_t) time(NULL) );
+    t->binary_format_major_version = 2;
+    t->binary_format_minor_version = 75;
+    t->build_epoch = (uint64_t) time(NULL);
+    t->num_headers = 0;
 
     return t;
 }
@@ -136,7 +143,7 @@ void insert_prefix(mmdb_tree_t *tree, prefix_t *p, int data)
   }
 }
 
-void mmdb_write_primitive_type(mmdb_type_t type, size_t size, void *val, FILE *fp)
+size_t mmdb_write_primitive_type(mmdb_type_t type, size_t size, void *val, FILE *fp)
 {
   unsigned char control = (type <= MMDB_MAP) ? (type << 5) : 0;
   unsigned char ext_type = (type > MMDB_MAP) ? (type - 7) : 0;
@@ -173,9 +180,12 @@ void mmdb_write_primitive_type(mmdb_type_t type, size_t size, void *val, FILE *f
   if (val) {
       fwrite(val, size, 1, fp);
   }
+
+  return 1 + nsize + (val ? size : 0);
 }
 
-void mmdb_write_pointer(size_t size, FILE *fp)
+// FIXME
+size_t mmdb_write_pointer(size_t size, FILE *fp)
 {
   unsigned char control = MMDB_POINTER << 5;
   uint32_t size_bytes = htobe32(size), nsize = 0;
@@ -200,6 +210,25 @@ void mmdb_write_pointer(size_t size, FILE *fp)
   fwrite(&control, 1, 1, fp);
   size_bytes = size_bytes >> (4-nsize)*8;
   fwrite(&size_bytes, nsize, 1, fp);
+  return 0;
+}
+
+size_t mmdb_write_uint16(uint16_t val, FILE *fp)
+{
+  val = htobe16(val);
+  return mmdb_write_primitive_type(MMDB_UINT16, 2, &val, fp);
+}
+
+size_t mmdb_write_uint32(uint32_t val, FILE *fp)
+{
+  val = htobe32(val);
+  return mmdb_write_primitive_type(MMDB_UINT32, 4, &val, fp);
+}
+
+size_t mmdb_write_uint64(uint32_t val, FILE *fp)
+{
+  val = htobe64(val);
+  return mmdb_write_primitive_type(MMDB_UINT64, 8, &val, fp);
 }
 
 void mmdb_write_metadata(mmdb_tree_t * t, FILE *fp)
@@ -209,16 +238,16 @@ void mmdb_write_metadata(mmdb_tree_t * t, FILE *fp)
 
   t->node_count = htobe32(t->node_count);
   mmdb_write_primitive_type(MMDB_STRING, 10, "node_count", fp);
-  mmdb_write_primitive_type(MMDB_UINT32, 4, &t->node_count, fp);
+  mmdb_write_uint32(t->node_count, fp);
 
   mmdb_write_primitive_type(MMDB_STRING, 27, "binary_format_major_version", fp);
-  mmdb_write_primitive_type(MMDB_UINT16, 2, &t->binary_format_major_version, fp);
+  mmdb_write_uint16(t->binary_format_major_version, fp);
 
   mmdb_write_primitive_type(MMDB_STRING, 27, "binary_format_minor_version", fp);
-  mmdb_write_primitive_type(MMDB_UINT16, 2, &t->binary_format_minor_version, fp);
+  mmdb_write_uint16(t->binary_format_minor_version, fp);
 
   mmdb_write_primitive_type(MMDB_STRING, 11, "build_epoch", fp);
-  mmdb_write_primitive_type(MMDB_UINT64, 4, &t->build_epoch, fp);
+  mmdb_write_uint64(t->build_epoch, fp);
 
   mmdb_write_primitive_type(MMDB_STRING, 13, "database_type", fp);
   mmdb_write_primitive_type(MMDB_STRING, strlen(t->database_type), t->database_type, fp);
@@ -229,14 +258,14 @@ void mmdb_write_metadata(mmdb_tree_t * t, FILE *fp)
   mmdb_write_primitive_type(MMDB_STRING, strlen(t->description_en), t->description_en, fp);
 
   mmdb_write_primitive_type(MMDB_STRING, 10, "ip_version", fp);
-  mmdb_write_primitive_type(MMDB_UINT16, 1, &t->ip_version, fp);
+  mmdb_write_uint16(t->ip_version, fp);
 
   mmdb_write_primitive_type(MMDB_STRING, 9, "languages", fp);
   mmdb_write_primitive_type(MMDB_ARRAY, 1, NULL, fp);
   mmdb_write_primitive_type(MMDB_STRING, 2, "en", fp);
 
   mmdb_write_primitive_type(MMDB_STRING, 11, "record_size", fp);
-  mmdb_write_primitive_type(MMDB_UINT16, 1, &t->record_size, fp);
+  mmdb_write_uint16(t->record_size, fp);
 }
 
 int mmdb_write_node(mmdb_tree_node_t *node, void* data)
@@ -269,17 +298,115 @@ void mmdb_write_tree(mmdb_tree_t *t, FILE *fp)
 void mmdb_write_file(mmdb_tree_t *t, FILE *fp)
 {
   mmdb_write_tree(t, fp);
+
+  fseek(fp, t->record_size * t->node_count, SEEK_SET);
   fwrite("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16, 1, fp);
+
   mmdb_write_metadata(t, fp);
 }
+
+void append_string(char ***arr, size_t *size, char *str)
+{
+  *size = *size + 1;
+  *arr = (char**)realloc(*arr, *size * sizeof(char*));
+  (*arr)[*size-1] = str;
+}
+
+char read_until_char(char *delimiters, char **str, size_t *size, FILE *fp)
+{
+  char buf[BUFSIZE], ch;
+  size_t written_to_buffer = 0, nbuffers = 0;
+  *size = 0;
+  while(1) {
+      ch = fgetc(fp);
+      /* printf("CHAR: %c %u %u\n", ch, *size, written_to_buffer); */
+      if(strchr(delimiters, ch) || ch == EOF) {
+          *str = realloc(*str, *size+1);
+          strncpy(*str+nbuffers*BUFSIZE, buf, written_to_buffer);
+          (*str)[*size] = '\0';
+          return ch;
+      }
+
+      if(written_to_buffer >= BUFSIZE) {
+          /* printf("Resetting buffer\n"); */
+          *str = realloc(*str, *size+1);
+          strncpy(*str+nbuffers*BUFSIZE, buf, written_to_buffer);
+          written_to_buffer = 0;
+          nbuffers++;
+      }
+
+      buf[written_to_buffer++] = ch;
+      *size = *size + 1;
+  }
+}
+
+size_t skip_to_char(char *delimiters, FILE *fp)
+{
+  char ch;
+  size_t count = 0;
+  while(1) {
+    ch = fgetc(fp);
+    count++;
+    if(strchr(delimiters, ch) || ch == EOF)
+      break;
+  }
+  return count;
+}
+
+void read_input_file(mmdb_tree_t *t, char *fname)
+{
+  FILE *fp = fopen(fname, "r");
+  char *str = NULL;
+  char **columns = NULL;
+  size_t size = 0, ncolumns = 0, pos = 0;
+  t->input = fp;
+  t->headers = NULL;
+  t->num_headers = 0;
+  char ch;
+  // Load headers array
+  while (1) {
+      ch = read_until_char("\t\n", &str, &size, fp);
+      pos += size + 1;
+      printf("Col name: %s\t\t(%d, %d)\t%d\n", str, size, pos, t->num_headers);
+      append_string(&(t->headers), &(t->num_headers), str);
+      str = NULL;
+      if (ch == '\n')
+        break;
+  }
+  prefix_t prefix;
+  printf("Header finished at %d\n", pos);
+  while(1) {
+      ch = read_until_char("\t\n", &str, &size, fp);
+
+      if (size == 0)
+        break;
+
+      pos += size + 1;
+
+      if (ch != '\t') {
+        fprintf(stderr, "IP range must be followed by TAB\n");
+        exit(1);
+      }
+
+      printf("Inserting prefix %s with data %d\n", str, pos);
+      parse_prefix(str, &prefix);
+      insert_prefix(t, &prefix, pos);
+
+      pos += skip_to_char("\n", fp);
+      str[0] = '\0';
+      if (ch == EOF)
+        break;
+  }
+}
+
 int main(int argc, char **argv)
 {
   prefix_t prefix;
   mmdb_tree_t *tree = make_tree();
 
   char buf[INET_ADDRSTRLEN+3] = "1.255.0.0";
-  parse_prefix(buf, &prefix);
-  insert_prefix(tree, &prefix, 123456);
+  /* parse_prefix(buf, &prefix); */
+  /* insert_prefix(tree, &prefix, 123456); */
 
   /* strcpy(buf, "1.2.3.4/24"); */
   /* parse_prefix(buf, &prefix); */
@@ -289,15 +416,17 @@ int main(int argc, char **argv)
   /* parse_prefix(buf, &prefix); */
   /* insert_prefix(tree, &prefix, 111); */
 
-  traverse_pre_order(tree->root, &print_node, NULL);
+  /* traverse_pre_order(tree->root, &print_node, NULL); */
 
   FILE *fp = fopen("./test.mmdb", "w");
-  mmdb_write_tree(tree, fp);
-  printf("Node count: %d\n", tree->node_count);
+  /* mmdb_write_tree(tree, fp); */
 
   /* mmdb_write_pointer(2049, fp); */
   /* mmdb_write_metadata(tree, fp); */
 
+  read_input_file(tree, "./biz.tsv");
+  printf("Node count: %d\n", tree->node_count);
+
   mmdb_write_file(tree, fp);
-  fclose(fp);
+  /* fclose(fp); */
 }

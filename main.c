@@ -5,6 +5,11 @@
 #include <time.h>
 #include <arpa/inet.h>
 #include <endian.h>
+#include <errno.h>
+
+#define DEBUG 1
+#define debug_print(fmt, ...) \
+            do { if (DEBUG) fprintf(stderr, fmt, __VA_ARGS__); } while (0)
 
 #define BUFSIZE 1024
 
@@ -32,6 +37,10 @@ typedef struct mmdb_tree {
 typedef struct {
     mmdb_tree_node_t *root;
 
+    FILE *outfile;
+    FILE *infile;
+    size_t data_written;
+
     uint32_t node_count;
     uint16_t record_size;
     uint16_t ip_version;
@@ -44,11 +53,10 @@ typedef struct {
 
     char **headers;
     size_t num_headers;
-    FILE *input;
 } mmdb_tree_t;
 
 typedef struct {
-    FILE *file;
+    int parent_data;
     mmdb_tree_t *tree;
 } mmdb_writer_data_t;
 
@@ -87,9 +95,12 @@ mmdb_tree_t* make_tree()
     t->database_type = "ipinfo";
     t->description_en = "ipinfo data";
     t->binary_format_major_version = 2;
-    t->binary_format_minor_version = 75;
+    t->binary_format_minor_version = 0;
     t->build_epoch = (uint64_t) time(NULL);
     t->num_headers = 0;
+    t->data_written = 0;
+    t->infile = NULL;
+    t->outfile = NULL;
 
     return t;
 }
@@ -134,17 +145,139 @@ void insert_prefix(mmdb_tree_t *tree, prefix_t *p, int data)
           tree->node_count++;
       }
 
-      if (bit)
-        cur->right = node;
-      else
-        cur->left = node;
+      if (bit) {
+          cur->right = node;
+          if (cur->data) {
+              printf("Inserting parent data %d to left node at bit %d\n", cur->data, sizeof(p->host)*8 -1 - i);
+              cur->left = cur->left ? cur->left : make_tree_node();
+              cur->left->data = cur->data;
+              tree->node_count++;
+          }
+      }
+      else {
+          cur->left = node;
+          if (cur->data) {
+              printf("Inserting parent data %d to right node at bit %d\n", cur->data, sizeof(p->host)*8 -1 - i);
+              cur->right = cur->right ? cur->right : make_tree_node();
+              cur->right->data = cur->data;
+              tree->node_count++;
+          }
+      }
 
       cur = node;
   }
 }
 
+/* ==== READ INPUT FILE ==== */
+void append_string(char ***arr, size_t *size, char *str)
+{
+  *size = *size + 1;
+  *arr = (char**)realloc(*arr, *size * sizeof(char*));
+  (*arr)[*size-1] = str;
+}
+
+char read_until_char(char *delimiters, char **str, size_t *size, FILE *fp)
+{
+  char buf[BUFSIZE], ch;
+  size_t written_to_buffer = 0, nbuffers = 0;
+  *size = 0;
+  while(1) {
+      ch = fgetc(fp);
+      debug_print("read_until_char: READ %c (%d)\n", ch, ch);
+      /* printf("CHAR: %c %u %u\n", ch, *size, written_to_buffer); */
+      if(strchr(delimiters, ch) || ch == EOF) {
+          *str = realloc(*str, (*size)+1);
+          strncpy(*str+nbuffers*BUFSIZE, buf, written_to_buffer);
+          (*str)[*size] = '\0';
+          return ch;
+      }
+
+      if(written_to_buffer >= BUFSIZE) {
+          /* printf("Resetting buffer\n"); */
+          *str = realloc(*str, (*size)+1);
+          strncpy(*str+nbuffers*BUFSIZE, buf, written_to_buffer);
+          written_to_buffer = 0;
+          nbuffers++;
+      }
+
+      buf[written_to_buffer++] = ch;
+      *size = *size + 1;
+  }
+}
+
+size_t skip_to_char(char *delimiters, FILE *fp)
+{
+  char ch;
+  size_t count = 0;
+  while(1) {
+    ch = fgetc(fp);
+    count++;
+    if(strchr(delimiters, ch) || ch == EOF)
+      break;
+  }
+  return count;
+}
+
+void read_input_file(mmdb_tree_t *t, char *fname)
+{
+  FILE *fp = fopen(fname, "r");
+  char *str = NULL;
+  char **columns = NULL;
+  size_t size = 0, ncolumns = 0, pos = 0;
+  t->infile = fp;
+  t->headers = NULL;
+  t->num_headers = 0;
+  char ch;
+  // Load headers array
+  while (1) {
+      ch = read_until_char("\t\n", &str, &size, fp);
+      pos += size + 1;
+      debug_print("Col name: %s\t\t(%d, %d)\t%d\n", str, size, pos, t->num_headers);
+      append_string(&(t->headers), &(t->num_headers), str);
+      str = NULL;
+      if (ch == '\n')
+        break;
+  }
+  prefix_t prefix;
+  debug_print("Header finished at %d\n", pos);
+  while(1) {
+      ch = read_until_char("\t\n", &str, &size, fp);
+
+      if (size == 0)
+        break;
+
+      pos += size + 1;
+
+      if (ch != '\t') {
+        fprintf(stderr, "IP range must be followed by TAB\n");
+        exit(1);
+      }
+
+      debug_print("Inserting prefix %s with data %d\n", str, pos);
+      parse_prefix(str, &prefix);
+      insert_prefix(t, &prefix, pos);
+
+      pos += skip_to_char("\n", fp);
+      str[0] = '\0';
+      if (ch == EOF)
+        break;
+  }
+}
+/* ==== READ INPUT FILE END ==== */
+
+/* ==== WRITE ==== */
+size_t safe_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
+{
+  size_t written = fwrite(ptr, size, nmemb, stream);
+  if (ferror(stream)) {
+    perror("safe_write");
+    exit(1);
+  }
+}
+
 size_t mmdb_write_primitive_type(mmdb_type_t type, size_t size, void *val, FILE *fp)
 {
+  debug_print("write primitive type=%d size=%d\n", type, size);
   unsigned char control = (type <= MMDB_MAP) ? (type << 5) : 0;
   unsigned char ext_type = (type > MMDB_MAP) ? (type - 7) : 0;
   uint32_t size_bytes = 0, nsize = 0;
@@ -166,19 +299,22 @@ size_t mmdb_write_primitive_type(mmdb_type_t type, size_t size, void *val, FILE 
       size_bytes = size - 65821;
   }
 
-  /* printf("Size: %d, nsize: %d, size_bytes: %d\n", size, nsize, size_bytes); */
-  /* printf("Ext type: %d\n", ext_type); */
-  /* printf("Control: %u\n", control); */
-  fwrite(&control, 1, 1, fp);
+  debug_print("Size: %d, nsize: %d, size_bytes: %d\n", size, nsize, size_bytes);
+  debug_print("Ext type: 0x%x\n", ext_type);
+  debug_print("Control byte: 0x%x\n", control);
+
+  fseek(fp, 0L, SEEK_CUR);
+  safe_fwrite(&control, 1, 1, fp);
+
   if (ext_type > 0) {
-      fwrite(&ext_type, 1, 1, fp);
+      safe_fwrite(&ext_type, 1, 1, fp);
   }
   if (nsize > 0) {
       size_bytes = htobe32(size_bytes) >> (4-nsize)*8;
-      fwrite(&size_bytes, nsize, 1, fp);
+      safe_fwrite(&size_bytes, nsize, 1, fp);
   }
   if (val) {
-      fwrite(val, size, 1, fp);
+      safe_fwrite(val, size, 1, fp);
   }
 
   return 1 + nsize + (val ? size : 0);
@@ -207,9 +343,9 @@ size_t mmdb_write_pointer(size_t size, FILE *fp)
       nsize = 4;
   }
 
-  fwrite(&control, 1, 1, fp);
+  safe_fwrite(&control, 1, 1, fp);
   size_bytes = size_bytes >> (4-nsize)*8;
-  fwrite(&size_bytes, nsize, 1, fp);
+  safe_fwrite(&size_bytes, nsize, 1, fp);
   return 0;
 }
 
@@ -225,7 +361,7 @@ size_t mmdb_write_uint32(uint32_t val, FILE *fp)
   return mmdb_write_primitive_type(MMDB_UINT32, 4, &val, fp);
 }
 
-size_t mmdb_write_uint64(uint32_t val, FILE *fp)
+size_t mmdb_write_uint64(uint64_t val, FILE *fp)
 {
   val = htobe64(val);
   return mmdb_write_primitive_type(MMDB_UINT64, 8, &val, fp);
@@ -233,10 +369,9 @@ size_t mmdb_write_uint64(uint32_t val, FILE *fp)
 
 void mmdb_write_metadata(mmdb_tree_t * t, FILE *fp)
 {
-  fwrite("\xab\xcd\xefMaxMind.com", 14, 1, fp);
+  safe_fwrite("\xab\xcd\xefMaxMind.com", 14, 1, fp);
   mmdb_write_primitive_type(MMDB_MAP, 9, NULL, fp);
 
-  t->node_count = htobe32(t->node_count);
   mmdb_write_primitive_type(MMDB_STRING, 10, "node_count", fp);
   mmdb_write_uint32(t->node_count, fp);
 
@@ -268,135 +403,112 @@ void mmdb_write_metadata(mmdb_tree_t * t, FILE *fp)
   mmdb_write_uint16(t->record_size, fp);
 }
 
+size_t mmdb_write_data(mmdb_tree_t *t, size_t offset, FILE *out)
+{
+  debug_print("write_data: %d\n", offset);
+  FILE *in = t->infile;
+  char ch, *str = NULL;
+  size_t size, idx = 1, bytes_written = 0;
+
+  // Move input pointer to start of the node payload (1st byte of 2nd column)
+  debug_print("Moving to offset %d in input file\n", offset);
+  if(fseek(in, offset, SEEK_SET) < 0) {
+      perror("mmdb_write_data:");
+      exit(1);
+  }
+  /* bytes_written += mmdb_write_primitive_type(MMDB_ARRAY, t->num_headers-1, NULL, out); */
+  bytes_written += mmdb_write_primitive_type(MMDB_MAP, t->num_headers-1, NULL, out);
+  /* bytes_written += mmdb_write_primitive_type(MMDB_STRING, 8, "hi there", out); */
+  /* bytes_written += mmdb_write_primitive_type(MMDB_STRING, 8, "hi there", out); */
+  /* bytes_written += mmdb_write_primitive_type(MMDB_STRING, 8, "i'm here", out); */
+  while (1) {
+      if(idx >= t->num_headers)
+        break;
+
+      debug_print("IDX=%d [%s](%d)\n", idx, t->headers[idx], strlen(t->headers[idx]));
+      bytes_written += mmdb_write_primitive_type(MMDB_STRING, strlen(t->headers[idx]), t->headers[idx], out);
+
+      debug_print("OUT=%p\n", out);
+      ch = read_until_char("\t\n", &str, &size, in);
+      debug_print("OUT=%p\n", out);
+      debug_print("here [%s](%d)\n", str, size);
+      bytes_written += mmdb_write_primitive_type(MMDB_STRING, size, str, out);
+
+      /* printf("Col: idx=%d, %s => [%s] Size=%d EndChar=%d\n", idx, t->headers[idx], str, size, ch); */
+
+      /* bytes_written += mmdb_write_primitive_type(MMDB_STRING, strlen(t->headers[idx]), t->headers[idx], out); */
+      /* if (ch == '\n' || ch == EOF || idx >= t->num_headers) */
+      /*   break; */
+
+      idx++;
+      if (str)
+        str = NULL;
+        /* str[0] = '\0'; */
+  }
+  debug_print("Reading data at offset %d. %d bytes written\n", offset, bytes_written);
+
+  t->data_written += bytes_written;
+  return bytes_written;
+}
+
 int mmdb_write_node(mmdb_tree_node_t *node, void* data)
 {
-
-  mmdb_writer_data_t *d = (mmdb_writer_data_t*) data;
+  mmdb_writer_data_t *d = (mmdb_writer_data_t *) data;
   mmdb_tree_t *tree = d->tree;
+  int parent_data = d->parent_data;
+  size_t data_start_offset = tree->node_count * tree->record_size / 8 * 2 + 16;
 
-  if (!d || !d->tree) return 1;
+  if (!tree) return 1;
 
-  ptr_t l = node->left ? node->left->index : tree->node_count; /* NO DATA */
-  ptr_t r = node->right ? node->right->index : tree->node_count; /* NO DATA */
+  ptr_t l = parent_data ? parent_data : tree->node_count; /* NO DATA */
+  ptr_t r = parent_data ? parent_data : tree->node_count; /* NO DATA */
+
+  if (node->left) {
+      if (node->left->data) {
+          fseek(tree->outfile, data_start_offset + tree->data_written, SEEK_SET);
+          l = tree->node_count + 16 + tree->data_written;
+          mmdb_write_data(tree, node->left->data, tree->outfile);
+      } else {
+          l = node->left->index;
+      }
+  }
+
+  if (node->right) {
+      if (node->right->data) {
+          debug_print("Seeking to %d, data_start_offset=%d\n", data_start_offset + tree->data_written, data_start_offset);
+          fseek(tree->outfile, data_start_offset + tree->data_written, SEEK_SET);
+          r = tree->node_count + 16 + tree->data_written;
+          mmdb_write_data(tree, node->right->data, tree->outfile);
+      } else {
+          r = node->right->index;
+      }
+  }
 
   ptr_t mmdb_node[2] = {htobe32(l), htobe32(r)};
 
-  printf("Seeking to %d\n", sizeof(mmdb_node)*node->index);
-  fseek(d->file, sizeof(mmdb_node)*node->index, SEEK_SET);
+  debug_print("Seeking to %d\n", sizeof(mmdb_node)*node->index);
+  fseek(tree->outfile, sizeof(mmdb_node)*node->index, SEEK_SET);
 
-  printf("Writing node %d (%d bytes)\n", node->index, sizeof(mmdb_node));
-  fwrite(mmdb_node, sizeof(mmdb_node), 1, d->file);
+  debug_print("Writing node %d (%d bytes)\n", node->index, sizeof(mmdb_node));
+  safe_fwrite(mmdb_node, sizeof(mmdb_node), 1, tree->outfile);
   return 0;
 }
 
 void mmdb_write_tree(mmdb_tree_t *t, FILE *fp)
 {
-  mmdb_writer_data_t data = {.file = fp, .tree = t};
-  traverse_pre_order(t->root, mmdb_write_node, (void*)&data);
+  t->outfile = fp;
+  mmdb_writer_data_t d = {.tree = t, .parent_data = 0};
+  traverse_pre_order(t->root, mmdb_write_node, (void*)&d);
 }
 
 void mmdb_write_file(mmdb_tree_t *t, FILE *fp)
 {
   mmdb_write_tree(t, fp);
 
-  fseek(fp, t->record_size * t->node_count, SEEK_SET);
-  fwrite("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16, 1, fp);
+  fseek(fp, t->record_size * t->node_count * 2, SEEK_SET);
+  safe_fwrite("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16, 1, fp);
 
   mmdb_write_metadata(t, fp);
-}
-
-void append_string(char ***arr, size_t *size, char *str)
-{
-  *size = *size + 1;
-  *arr = (char**)realloc(*arr, *size * sizeof(char*));
-  (*arr)[*size-1] = str;
-}
-
-char read_until_char(char *delimiters, char **str, size_t *size, FILE *fp)
-{
-  char buf[BUFSIZE], ch;
-  size_t written_to_buffer = 0, nbuffers = 0;
-  *size = 0;
-  while(1) {
-      ch = fgetc(fp);
-      /* printf("CHAR: %c %u %u\n", ch, *size, written_to_buffer); */
-      if(strchr(delimiters, ch) || ch == EOF) {
-          *str = realloc(*str, *size+1);
-          strncpy(*str+nbuffers*BUFSIZE, buf, written_to_buffer);
-          (*str)[*size] = '\0';
-          return ch;
-      }
-
-      if(written_to_buffer >= BUFSIZE) {
-          /* printf("Resetting buffer\n"); */
-          *str = realloc(*str, *size+1);
-          strncpy(*str+nbuffers*BUFSIZE, buf, written_to_buffer);
-          written_to_buffer = 0;
-          nbuffers++;
-      }
-
-      buf[written_to_buffer++] = ch;
-      *size = *size + 1;
-  }
-}
-
-size_t skip_to_char(char *delimiters, FILE *fp)
-{
-  char ch;
-  size_t count = 0;
-  while(1) {
-    ch = fgetc(fp);
-    count++;
-    if(strchr(delimiters, ch) || ch == EOF)
-      break;
-  }
-  return count;
-}
-
-void read_input_file(mmdb_tree_t *t, char *fname)
-{
-  FILE *fp = fopen(fname, "r");
-  char *str = NULL;
-  char **columns = NULL;
-  size_t size = 0, ncolumns = 0, pos = 0;
-  t->input = fp;
-  t->headers = NULL;
-  t->num_headers = 0;
-  char ch;
-  // Load headers array
-  while (1) {
-      ch = read_until_char("\t\n", &str, &size, fp);
-      pos += size + 1;
-      printf("Col name: %s\t\t(%d, %d)\t%d\n", str, size, pos, t->num_headers);
-      append_string(&(t->headers), &(t->num_headers), str);
-      str = NULL;
-      if (ch == '\n')
-        break;
-  }
-  prefix_t prefix;
-  printf("Header finished at %d\n", pos);
-  while(1) {
-      ch = read_until_char("\t\n", &str, &size, fp);
-
-      if (size == 0)
-        break;
-
-      pos += size + 1;
-
-      if (ch != '\t') {
-        fprintf(stderr, "IP range must be followed by TAB\n");
-        exit(1);
-      }
-
-      printf("Inserting prefix %s with data %d\n", str, pos);
-      parse_prefix(str, &prefix);
-      insert_prefix(t, &prefix, pos);
-
-      pos += skip_to_char("\n", fp);
-      str[0] = '\0';
-      if (ch == EOF)
-        break;
-  }
 }
 
 int main(int argc, char **argv)
@@ -404,9 +516,12 @@ int main(int argc, char **argv)
   prefix_t prefix;
   mmdb_tree_t *tree = make_tree();
 
-  char buf[INET_ADDRSTRLEN+3] = "1.255.0.0";
+  char * infile = argc > 1 ? argv[1] : "./biz.tsv";
+  char * outfile = argc > 2 ? argv[2] : "./test.mmdb";
+
+  char buf[INET_ADDRSTRLEN+3] = "255.255.0.0/16";
   /* parse_prefix(buf, &prefix); */
-  /* insert_prefix(tree, &prefix, 123456); */
+  /* insert_prefix(tree, &prefix, 0); */
 
   /* strcpy(buf, "1.2.3.4/24"); */
   /* parse_prefix(buf, &prefix); */
@@ -416,17 +531,23 @@ int main(int argc, char **argv)
   /* parse_prefix(buf, &prefix); */
   /* insert_prefix(tree, &prefix, 111); */
 
-  /* traverse_pre_order(tree->root, &print_node, NULL); */
-
-  FILE *fp = fopen("./test.mmdb", "w");
+  FILE *fp = fopen(outfile, "w");
   /* mmdb_write_tree(tree, fp); */
 
   /* mmdb_write_pointer(2049, fp); */
   /* mmdb_write_metadata(tree, fp); */
 
-  read_input_file(tree, "./biz.tsv");
+  printf("Building tree..\n");
+  read_input_file(tree, infile);
+
+  /* traverse_pre_order(tree->root, &print_node, NULL); */
+
   printf("Node count: %d\n", tree->node_count);
 
+  printf("Writing file %s\n", outfile);
   mmdb_write_file(tree, fp);
+  printf("Done\n");
+  /* mmdb_write_data(tree, 101, fp); */
+
   /* fclose(fp); */
 }

@@ -107,7 +107,7 @@ mmdb_tree_t* make_tree()
 
 int print_node(mmdb_tree_node_t *t, void* unused)
 {
-    printf("%d [%d]\n", t->index, t->data);
+    printf("%d:\t%d | %d [%d]\n", t->index, t->left ? t->left->index : -1, t->right ? t->right->index : -1, t->data);
     /* if(t->data) return 1; */
     return 0;
 }
@@ -131,15 +131,20 @@ void insert_prefix(mmdb_tree_t *tree, prefix_t *p, int data)
       tree->node_count++;
   }
 
+  int parent_data = 0;
   for(i=sizeof(p->host)*8 - 1; i>=0; i--) {
+      if (cur && cur->data)
+        parent_data = cur->data;
 
       if(counter++ == p->masklen-1) {
+          printf("Inserting data %d to node at bit %d\n", data, sizeof(p->host)*8 -1 - i);
         cur->data = data;
         return;
       }
 
       bit = (p->host >> i) & 1;
       node = (bit ? cur->right : cur->left);
+
       if (!node) {
           node = make_tree_node();
           tree->node_count++;
@@ -147,20 +152,20 @@ void insert_prefix(mmdb_tree_t *tree, prefix_t *p, int data)
 
       if (bit) {
           cur->right = node;
-          if (cur->data) {
-              printf("Inserting parent data %d to left node at bit %d\n", cur->data, sizeof(p->host)*8 -1 - i);
-              cur->left = cur->left ? cur->left : make_tree_node();
-              cur->left->data = cur->data;
-              tree->node_count++;
+          if (parent_data) {
+              printf("Inserting PARENT data %d to left node at bit %d\n", parent_data, sizeof(p->host)*8 -1 - i);
+              cur->left = cur->left ? cur->left : (tree->node_count++, make_tree_node());
+              cur->left->data = -abs(parent_data);
+              cur->data = 0;
           }
       }
       else {
           cur->left = node;
-          if (cur->data) {
-              printf("Inserting parent data %d to right node at bit %d\n", cur->data, sizeof(p->host)*8 -1 - i);
-              cur->right = cur->right ? cur->right : make_tree_node();
-              cur->right->data = cur->data;
-              tree->node_count++;
+          if (parent_data) {
+              printf("Inserting PARENT data %d to right node at bit %d\n", parent_data, sizeof(p->host)*8 -1 - i);
+              cur->right = cur->right ? cur->right : (tree->node_count++, make_tree_node());
+              cur->right->data = -abs(parent_data);
+              cur->data = 0;
           }
       }
 
@@ -183,7 +188,7 @@ char read_until_char(char *delimiters, char **str, size_t *size, FILE *fp)
   *size = 0;
   while(1) {
       ch = fgetc(fp);
-      debug_print("read_until_char: READ %c (%d)\n", ch, ch);
+      /* debug_print("read_until_char: READ %c (%d)\n", ch, ch); */
       /* printf("CHAR: %c %u %u\n", ch, *size, written_to_buffer); */
       if(strchr(delimiters, ch) || ch == EOF) {
           *str = realloc(*str, (*size)+1);
@@ -299,9 +304,10 @@ size_t mmdb_write_primitive_type(mmdb_type_t type, size_t size, void *val, FILE 
       size_bytes = size - 65821;
   }
 
-  debug_print("Size: %d, nsize: %d, size_bytes: %d\n", size, nsize, size_bytes);
-  debug_print("Ext type: 0x%x\n", ext_type);
-  debug_print("Control byte: 0x%x\n", control);
+  debug_print("write_wrimitive_type: Control byte: 0x%x; Size: %d, extra bytes of size (%d): size_bytes: %d; Extended type: 0x%x\n",
+              control, size, nsize, size_bytes, ext_type);
+  /* debug_print("Ext type: 0x%x\n", ext_type); */
+  /* debug_print("Control byte: 0x%x\n", control); */
 
   fseek(fp, 0L, SEEK_CUR);
   safe_fwrite(&control, 1, 1, fp);
@@ -416,22 +422,16 @@ size_t mmdb_write_data(mmdb_tree_t *t, size_t offset, FILE *out)
       perror("mmdb_write_data:");
       exit(1);
   }
-  /* bytes_written += mmdb_write_primitive_type(MMDB_ARRAY, t->num_headers-1, NULL, out); */
   bytes_written += mmdb_write_primitive_type(MMDB_MAP, t->num_headers-1, NULL, out);
-  /* bytes_written += mmdb_write_primitive_type(MMDB_STRING, 8, "hi there", out); */
-  /* bytes_written += mmdb_write_primitive_type(MMDB_STRING, 8, "hi there", out); */
-  /* bytes_written += mmdb_write_primitive_type(MMDB_STRING, 8, "i'm here", out); */
   while (1) {
       if(idx >= t->num_headers)
         break;
 
-      debug_print("IDX=%d [%s](%d)\n", idx, t->headers[idx], strlen(t->headers[idx]));
+      debug_print("HEADER %d: [%s](%d)\n", idx, t->headers[idx], strlen(t->headers[idx]));
       bytes_written += mmdb_write_primitive_type(MMDB_STRING, strlen(t->headers[idx]), t->headers[idx], out);
 
-      debug_print("OUT=%p\n", out);
       ch = read_until_char("\t\n", &str, &size, in);
-      debug_print("OUT=%p\n", out);
-      debug_print("here [%s](%d)\n", str, size);
+      debug_print("VALUE [%s](%d)\n", str, size);
       bytes_written += mmdb_write_primitive_type(MMDB_STRING, size, str, out);
 
       /* printf("Col: idx=%d, %s => [%s] Size=%d EndChar=%d\n", idx, t->headers[idx], str, size, ch); */
@@ -453,18 +453,16 @@ size_t mmdb_write_data(mmdb_tree_t *t, size_t offset, FILE *out)
 
 int mmdb_write_node(mmdb_tree_node_t *node, void* data)
 {
-  mmdb_writer_data_t *d = (mmdb_writer_data_t *) data;
-  mmdb_tree_t *tree = d->tree;
-  int parent_data = d->parent_data;
+  mmdb_tree_t *tree = (mmdb_tree_t*)data;
   size_t data_start_offset = tree->node_count * tree->record_size / 8 * 2 + 16;
 
   if (!tree) return 1;
 
-  ptr_t l = parent_data ? parent_data : tree->node_count; /* NO DATA */
-  ptr_t r = parent_data ? parent_data : tree->node_count; /* NO DATA */
+  ptr_t l = tree->node_count; /* NO DATA */
+  ptr_t r = tree->node_count; /* NO DATA */
 
   if (node->left) {
-      if (node->left->data) {
+      if (node->left->data > 0) {
           fseek(tree->outfile, data_start_offset + tree->data_written, SEEK_SET);
           l = tree->node_count + 16 + tree->data_written;
           mmdb_write_data(tree, node->left->data, tree->outfile);
@@ -474,7 +472,7 @@ int mmdb_write_node(mmdb_tree_node_t *node, void* data)
   }
 
   if (node->right) {
-      if (node->right->data) {
+      if (node->right->data > 0) {
           debug_print("Seeking to %d, data_start_offset=%d\n", data_start_offset + tree->data_written, data_start_offset);
           fseek(tree->outfile, data_start_offset + tree->data_written, SEEK_SET);
           r = tree->node_count + 16 + tree->data_written;
@@ -497,8 +495,7 @@ int mmdb_write_node(mmdb_tree_node_t *node, void* data)
 void mmdb_write_tree(mmdb_tree_t *t, FILE *fp)
 {
   t->outfile = fp;
-  mmdb_writer_data_t d = {.tree = t, .parent_data = 0};
-  traverse_pre_order(t->root, mmdb_write_node, (void*)&d);
+  traverse_pre_order(t->root, mmdb_write_node, t);
 }
 
 void mmdb_write_file(mmdb_tree_t *t, FILE *fp)
@@ -540,7 +537,7 @@ int main(int argc, char **argv)
   printf("Building tree..\n");
   read_input_file(tree, infile);
 
-  /* traverse_pre_order(tree->root, &print_node, NULL); */
+  traverse_pre_order(tree->root, &print_node, NULL);
 
   printf("Node count: %d\n", tree->node_count);
 

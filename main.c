@@ -27,11 +27,15 @@ typedef struct {
     uint8_t masklen;
 } prefix_t;
 
+typedef struct {
+  int val;
+} mmdb_node_data_t;
+
 typedef struct mmdb_tree {
     struct mmdb_tree *left;
     struct mmdb_tree *right;
     uint32_t index;
-    int data;
+    mmdb_node_data_t *data;
 } mmdb_tree_node_t;
 
 typedef struct {
@@ -82,7 +86,15 @@ mmdb_tree_node_t * make_tree_node()
   static uint32_t index = 0;
   mmdb_tree_node_t *node = (mmdb_tree_node_t*) calloc(1, sizeof(mmdb_tree_t));
   node->index = index++;
+  node->data = NULL;
   return node;
+}
+
+mmdb_node_data_t * make_data(int val)
+{
+  mmdb_node_data_t * data = (mmdb_node_data_t*) calloc(1, sizeof(mmdb_node_data_t));
+  data->val = val;
+  return data;
 }
 
 mmdb_tree_t* make_tree()
@@ -107,7 +119,7 @@ mmdb_tree_t* make_tree()
 
 int print_node(mmdb_tree_node_t *t, void* unused)
 {
-    printf("%d:\t%d | %d [%d]\n", t->index, t->left ? t->left->index : -1, t->right ? t->right->index : -1, t->data);
+    printf("%d:\t%d | %d [%d]\n", t->index, t->left ? t->left->index : -1, t->right ? t->right->index : -1, t->data ? t->data->val : -1);
     /* if(t->data) return 1; */
     return 0;
 }
@@ -121,9 +133,10 @@ void traverse_pre_order(mmdb_tree_node_t *t, int (*func)(mmdb_tree_node_t *, voi
     traverse_pre_order(t->right, func, data);
 }
 
-void insert_prefix(mmdb_tree_t *tree, prefix_t *p, int data)
+void insert_prefix(mmdb_tree_t *tree, prefix_t *p, int val)
 {
   mmdb_tree_node_t *cur = tree->root, *node;
+  mmdb_node_data_t *data = make_data(val);
 
   int i, bit, counter = 0;
   if (!cur) {
@@ -131,15 +144,16 @@ void insert_prefix(mmdb_tree_t *tree, prefix_t *p, int data)
       tree->node_count++;
   }
 
-  int parent_data = 0;
+  mmdb_node_data_t *parent_data = NULL;
   for(i=sizeof(p->host)*8 - 1; i>=0; i--) {
+
       if (cur && cur->data)
         parent_data = cur->data;
 
       if(counter++ == p->masklen-1) {
-          printf("Inserting data %d to node at bit %d\n", data, sizeof(p->host)*8 -1 - i);
-        cur->data = data;
-        return;
+          printf("Inserting data %d to node at bit %d\n", val, sizeof(p->host)*8 -1 - i);
+          cur->data = data;
+          return;
       }
 
       bit = (p->host >> i) & 1;
@@ -152,25 +166,26 @@ void insert_prefix(mmdb_tree_t *tree, prefix_t *p, int data)
 
       if (bit) {
           cur->right = node;
-          if (parent_data) {
-              printf("Inserting PARENT data %d to left node at bit %d\n", parent_data, sizeof(p->host)*8 -1 - i);
+          if (parent_data && parent_data->val) {
+              printf("Inserting PARENT data %d to left node at bit %d\n", parent_data->val, sizeof(p->host)*8 -1 - i);
               cur->left = cur->left ? cur->left : (tree->node_count++, make_tree_node());
-              cur->left->data = -abs(parent_data);
-              cur->data = 0;
+              cur->left->data = parent_data;
+              cur->data = NULL;
           }
       }
       else {
           cur->left = node;
-          if (parent_data) {
-              printf("Inserting PARENT data %d to right node at bit %d\n", parent_data, sizeof(p->host)*8 -1 - i);
+          if (parent_data && parent_data->val) {
+              printf("Inserting PARENT data %d to right node at bit %d\n", parent_data->val, sizeof(p->host)*8 -1 - i);
               cur->right = cur->right ? cur->right : (tree->node_count++, make_tree_node());
-              cur->right->data = -abs(parent_data);
-              cur->data = 0;
+              cur->right->data = parent_data;
+              cur->data = NULL;
           }
       }
 
       cur = node;
   }
+  free(data);
 }
 
 /* ==== READ INPUT FILE ==== */
@@ -409,16 +424,25 @@ void mmdb_write_metadata(mmdb_tree_t * t, FILE *fp)
   mmdb_write_uint16(t->record_size, fp);
 }
 
-size_t mmdb_write_data(mmdb_tree_t *t, size_t offset, FILE *out)
+size_t mmdb_write_data(mmdb_tree_t *t, mmdb_node_data_t *offset, FILE *out)
 {
-  debug_print("write_data: %d\n", offset);
+  if (!offset) {
+      debug_print("write_data called with NULL offset\n", 0);
+      return 0;
+  }
+
+  if(offset->val < 0) {
+      // The data is already written
+      return 0;
+  }
+  debug_print("write_data: %d\n", offset->val);
   FILE *in = t->infile;
   char ch, *str = NULL;
   size_t size, idx = 1, bytes_written = 0;
 
   // Move input pointer to start of the node payload (1st byte of 2nd column)
-  debug_print("Moving to offset %d in input file\n", offset);
-  if(fseek(in, offset, SEEK_SET) < 0) {
+  debug_print("Moving to offset %d in input file\n", offset->val);
+  if(fseek(in, offset->val, SEEK_SET) < 0) {
       perror("mmdb_write_data:");
       exit(1);
   }
@@ -445,9 +469,10 @@ size_t mmdb_write_data(mmdb_tree_t *t, size_t offset, FILE *out)
         str = NULL;
         /* str[0] = '\0'; */
   }
-  debug_print("Reading data at offset %d. %d bytes written\n", offset, bytes_written);
+  debug_print("Reading data at offset %d. %d bytes written\n", offset->val, bytes_written);
 
   t->data_written += bytes_written;
+  offset->val *= -1;
   return bytes_written;
 }
 
@@ -462,7 +487,7 @@ int mmdb_write_node(mmdb_tree_node_t *node, void* data)
   ptr_t r = tree->node_count; /* NO DATA */
 
   if (node->left) {
-      if (node->left->data > 0) {
+      if (node->left->data) {
           fseek(tree->outfile, data_start_offset + tree->data_written, SEEK_SET);
           l = tree->node_count + 16 + tree->data_written;
           mmdb_write_data(tree, node->left->data, tree->outfile);
@@ -472,7 +497,7 @@ int mmdb_write_node(mmdb_tree_node_t *node, void* data)
   }
 
   if (node->right) {
-      if (node->right->data > 0) {
+      if (node->right->data) {
           debug_print("Seeking to %d, data_start_offset=%d\n", data_start_offset + tree->data_written, data_start_offset);
           fseek(tree->outfile, data_start_offset + tree->data_written, SEEK_SET);
           r = tree->node_count + 16 + tree->data_written;

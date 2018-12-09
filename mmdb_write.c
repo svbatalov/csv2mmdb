@@ -244,7 +244,8 @@ void mmdb_write_file(mmdb_tree_t *t, FILE *fp)
 {
   mmdb_write_tree(t, fp);
 
-  fseek(fp, t->record_size * t->node_count * 2, SEEK_SET);
+  size_t metadata_start_offset = t->node_count * t->record_size / 8 * 2 + 16 + t->data_written;
+  fseek(fp, metadata_start_offset, SEEK_SET);
   safe_fwrite("\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", 16, 1, fp);
 
   mmdb_write_metadata(t, fp);

@@ -1,5 +1,5 @@
-csv2mmdb: main.c
-	$(CC) -g $< -o $@
+csv2mmdb: mmdb_write.o csv_read.o tree.o main.o
+	$(CC) -g $^ -o $@
 
 clean:
 	rm -f csv2mmdb *.o

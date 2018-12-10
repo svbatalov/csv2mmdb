@@ -61,6 +61,7 @@ typedef struct {
 
     char **headers;
     size_t num_headers;
+    size_t *header_offset;
 } mmdb_tree_t;
 
 typedef struct {

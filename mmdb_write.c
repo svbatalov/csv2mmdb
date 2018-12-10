@@ -238,10 +238,29 @@ void mmdb_write_tree(mmdb_tree_t *t, FILE *fp)
 {
   t->outfile = fp;
   traverse_pre_order(t->root, mmdb_write_node, t);
+
+  size_t offset = t->node_count * t->record_size / 8 * 2 + 16 + t->data_written;
+  fseek(fp, offset, SEEK_SET);
+  t->data_written += mmdb_write_primitive_type(MMDB_DATA_END, 0, NULL, fp);
+}
+
+void mmdb_write_headers(mmdb_tree_t * t, FILE *fp)
+{
+  size_t offset = t->node_count * t->record_size / 8 * 2 + 16 + t->data_written;
+  fseek(fp, offset, SEEK_SET);
+  t->header_offset = (size_t*) calloc(t->num_headers, sizeof(size_t));
+  int i;
+  for(i=0; i<t->num_headers; i++) {
+      t->data_written += mmdb_write_primitive_type(MMDB_CACHE, 0, NULL, fp);
+      t->header_offset[i] = t->data_written;
+      debug_print("header_offset=%d\n", t->header_offset[i]);
+      t->data_written += mmdb_write_primitive_type(MMDB_STRING, strlen(t->headers[i]), t->headers[i], fp);
+  }
 }
 
 void mmdb_write_file(mmdb_tree_t *t, FILE *fp)
 {
+  mmdb_write_headers(t, fp);
   mmdb_write_tree(t, fp);
 
   size_t metadata_start_offset = t->node_count * t->record_size / 8 * 2 + 16 + t->data_written;

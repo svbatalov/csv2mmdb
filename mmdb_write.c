@@ -9,6 +9,7 @@ size_t safe_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
     perror("safe_write");
     exit(1);
   }
+  return written;
 }
 
 size_t mmdb_write_primitive_type(mmdb_type_t type, size_t size, void *val, FILE *fp)
@@ -35,26 +36,28 @@ size_t mmdb_write_primitive_type(mmdb_type_t type, size_t size, void *val, FILE 
       size_bytes = size - 65821;
   }
 
-  debug_print("write_wrimitive_type: Control byte: 0x%x; Size: %d, extra bytes of size (%d): size_bytes: %d; Extended type: 0x%x\n",
+  debug_print("write_primitive_type: Control byte: 0x%x; Size: %d, extra bytes of size (%d): size_bytes: %d; Extended type: 0x%x\n",
               control, size, nsize, size_bytes, ext_type);
   /* debug_print("Ext type: 0x%x\n", ext_type); */
   /* debug_print("Control byte: 0x%x\n", control); */
 
+  size_t written = 0;
   fseek(fp, 0L, SEEK_CUR);
-  safe_fwrite(&control, 1, 1, fp);
+  written += safe_fwrite(&control, 1, 1, fp);
 
   if (ext_type > 0) {
-      safe_fwrite(&ext_type, 1, 1, fp);
+      written += safe_fwrite(&ext_type, 1, 1, fp);
   }
   if (nsize > 0) {
       size_bytes = htobe32(size_bytes) >> (4-nsize)*8;
-      safe_fwrite(&size_bytes, nsize, 1, fp);
+      written += safe_fwrite(&size_bytes, nsize, 1, fp);
   }
   if (val) {
-      safe_fwrite(val, size, 1, fp);
+      written += safe_fwrite(val, size, 1, fp);
   }
 
-  return 1 + nsize + (val ? size : 0);
+  /* return written; */
+  return 1 + nsize + (ext_type > 0 ? 1 : 0) + (val ? size : 0);
 }
 
 // FIXME
@@ -65,7 +68,7 @@ size_t mmdb_write_pointer(size_t size, FILE *fp)
 
   if (size < 1<<11 /* 2048 */) {
       control |= (htobe32(size) & 0x700) >> 8;
-      size_bytes = htobe32(size) & 0xFF;
+      size_bytes = htobe32(size & 0xFF);
       nsize = 1;
   } else if (size < 526336) {
       size_bytes = htobe32(size - 2048);
@@ -80,10 +83,13 @@ size_t mmdb_write_pointer(size_t size, FILE *fp)
       nsize = 4;
   }
 
-  safe_fwrite(&control, 1, 1, fp);
+  size_t written = 0;
+
+  written += safe_fwrite(&control, 1, 1, fp);
   size_bytes = size_bytes >> (4-nsize)*8;
-  safe_fwrite(&size_bytes, nsize, 1, fp);
-  return 0;
+  debug_print("write_pointer(%d): Control byte: 0x%x; Size: %d (%d bytes)\n", size, control, size_bytes, nsize);
+  written += safe_fwrite(&size_bytes, nsize, 1, fp);
+  return written;
 }
 
 size_t mmdb_write_uint16(uint16_t val, FILE *fp)
@@ -171,6 +177,9 @@ size_t mmdb_write_data(mmdb_tree_t *t, mmdb_node_data_t *offset, FILE *out)
       debug_print("HEADER %d: [%s](%d)\n", idx, t->headers[idx], strlen(t->headers[idx]));
       bytes_written += mmdb_write_primitive_type(MMDB_STRING, strlen(t->headers[idx]), t->headers[idx], out);
 
+      /* debug_print("POINTER %d\n", t->header_offset[idx]); */
+      /* bytes_written += mmdb_write_pointer(t->header_offset[idx], out); */
+
       ch = read_until_char("\t\n", &str, &size, in);
       debug_print("VALUE [%s](%d)\n", str, size);
       bytes_written += mmdb_write_primitive_type(MMDB_STRING, size, str, out);
@@ -253,7 +262,8 @@ void mmdb_write_headers(mmdb_tree_t * t, FILE *fp)
   for(i=0; i<t->num_headers; i++) {
       t->data_written += mmdb_write_primitive_type(MMDB_CACHE, 0, NULL, fp);
       t->header_offset[i] = t->data_written;
-      debug_print("header_offset=%d\n", t->header_offset[i]);
+      debug_print("header %d offset=%d\n", i, t->header_offset[i]);
+      debug_print("header_len=%d\n", strlen(t->headers[i]));
       t->data_written += mmdb_write_primitive_type(MMDB_STRING, strlen(t->headers[i]), t->headers[i], fp);
   }
 }

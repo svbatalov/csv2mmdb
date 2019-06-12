@@ -35,14 +35,13 @@ char read_until_char(char *delimiters, char **str, size_t *size, FILE *fp)
       /* debug_print("read_until_char: READ %c (%d)\n", ch, ch); */
       /* printf("CHAR: %c %u %u\n", ch, *size, written_to_buffer); */
       if(strchr(delimiters, ch) || ch == EOF) {
-          *str = realloc(*str, (*size)+1);
+          *str = realloc(*str, *size + 1);
           strncpy(*str+nbuffers*BUFSIZE, buf, written_to_buffer);
           (*str)[*size] = '\0';
           return ch;
       }
 
       if(written_to_buffer >= BUFSIZE) {
-          /* printf("Resetting buffer\n"); */
           *str = realloc(*str, (*size)+1);
           strncpy(*str+nbuffers*BUFSIZE, buf, written_to_buffer);
           written_to_buffer = 0;
@@ -52,6 +51,7 @@ char read_until_char(char *delimiters, char **str, size_t *size, FILE *fp)
       buf[written_to_buffer++] = ch;
       *size = *size + 1;
   }
+  return 0;
 }
 
 size_t skip_to_char(char *delimiters, FILE *fp)
@@ -81,7 +81,7 @@ void read_input_file(mmdb_tree_t *t, char *fname)
   while (1) {
       ch = read_until_char("\t\n", &str, &size, fp);
       pos += size + 1;
-      debug_print("Col name: %s\t\t(%d, %d)\t%d\n", str, size, pos, t->num_headers);
+      debug_print("Col name: %s\t\t(len: %d, pos: %d)\t%d\n", str, size, pos, t->num_headers);
       append_string(&(t->headers), &(t->num_headers), str);
       str = NULL;
       if (ch == '\n')
@@ -104,10 +104,12 @@ void read_input_file(mmdb_tree_t *t, char *fname)
 
       debug_print("Inserting prefix %s with data %d\n", str, pos);
       parse_prefix(str, &prefix);
+      free(str);
+      str = NULL;
       insert_prefix(t, &prefix, pos);
 
       pos += skip_to_char("\n", fp);
-      str[0] = '\0';
+      /* str[0] = '\0'; */
       if (ch == EOF)
         break;
   }
